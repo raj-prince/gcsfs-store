@@ -1,3 +1,3 @@
 version: 1
 id: gcsfs-store
-remote: git@github.com:raj-prince/gcsfs-specs.git
+remote: git@github.com:raj-prince/gcsfs-store.git
