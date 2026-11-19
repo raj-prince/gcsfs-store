@@ -37,9 +37,11 @@ See `proposal.md` for background and problem motivation.
 * **Alternatives Considered**: Keeping `MRDPoolCache` returning `MRDPool` proxies (retains unnecessary indirection and per-pool stream hoarding).
 
 ### 3. Concurrent Initialization Deduplication via Asyncio Futures
-* **Decision**: When `acquire()` misses both active and inactive entries, the first coroutine registers an `asyncio.Future` in `self._pending[key]` and initiates `create_mrd()`. Subsequent concurrent calls await `_pending[key]`.
-* **Rationale**: Eliminates race conditions where concurrent readers on the same cold object open duplicate gRPC streams. Using futures avoids managing individual per-key locks and lock lifecycles.
-* **Alternatives Considered**: Global lock during creation (serializes creation across different objects), or per-key `asyncio.Lock` (requires extra cleanup logic for orphaned locks).
+* **Decision**: When `acquire()` misses both active and inactive entries, the first coroutine registers an `asyncio.Future` in `self._pending[key]` and initiates `create_mrd()`. Subsequent concurrent calls await `asyncio.shield(self._pending[key])`.
+  - Using `asyncio.shield()` ensures that if a *waiting* coroutine is cancelled, `CancelledError` propagates immediately to that waiter without cancelling the shared future or disrupting the active creator.
+  - Conversely, if the *creator* coroutine is cancelled or fails with an `Exception`, surviving waiters catch the failure and retry the loop—either picking up an active MRD or taking over as the new creator themselves.
+* **Rationale**: Eliminates race conditions where concurrent readers on the same cold object open duplicate gRPC streams, while isolating caller-scoped cancellations from shared initialization.
+* **Alternatives Considered**: Global lock during creation (serializes creation across different objects), per-key `asyncio.Lock` (requires extra cleanup logic for orphaned locks), or unshielded `await fut` (allows waiter cancellation to abort the creator and creator cancellation to fail healthy waiters).
 
 ### 4. Sensible Stream Scaling Heuristics
 * **Decision**: Pass `MultiStreamConfig(min_streams=1, max_streams=concurrency)` where concurrency is derived from file size or caller configuration, defaulting to:
@@ -49,19 +51,20 @@ See `proposal.md` for background and problem motivation.
   - Hard upper bound: 8 streams
 * **Rationale**: Python GIL limitations cap effective single-process throughput at ~2 GB/s, which 4–8 streams fully saturate. Exceeding 8 streams wastes backend connections and memory buffers.
 
-### 5. `generation=None` Resolution & Unfinalized Object Lifecycle
+### 5. Metadata Fast-Path, `generation=None` Resolution & Unfinalized Object Lifecycle
 * **Decision**: 
-  - When `generation is None`, `acquire()` queries `fs._info(path)` to determine the latest concrete `generation`, `finalized` status (`timeFinalized is not None`), and `size`.
-  - Keys in `_active` and `_inactive` are keyed by the resolved concrete generation.
-  - For unfinalized objects:
-    - If an active entry already exists but `info["size"] > mrd.persisted_size`, the manager creates a new MRD with the updated size, replaces `_active[key]`, and allows existing readers on the older instance to finish and close.
+  - **PID & Event-Loop Check First**: `acquire()` checks `os.getpid()` and `asyncio.get_running_loop()` on entry (before any `_info()` RPC) and clears `_active`, `_inactive`, and `_pending` on mismatch.
+  - **Fast-Path Cache Hit (`generation is not None`)**: When `generation` is explicitly provided, `acquire()` immediately checks `_active` (only if `entry[0].finalized` is `True`) and `_inactive` (which holds only finalized MRDs). A hit returns immediately in `O(1)` without issuing an `fs._info()` network RPC.
+  - **Metadata Lookup (`generation is None` or uncached / unfinalized)**: Otherwise, `acquire()` queries `fs._info(path, generation=generation)` to determine the concrete `generation`, `finalized` status (`timeFinalized is not None`), and `size`.
+  - **Unfinalized Object Freshness**:
+    - Active unfinalized entries (`finalized == False`) always fall through to `fs._info()`—even when `generation` is passed—so if `info["size"] > mrd.persisted_size`, the manager replaces `_active[key]` with a fresh MRD reflecting the expanded size while existing readers finish on the previous instance.
     - On `release()`, if `mrd.finalized` is false, it is closed immediately and NEVER inserted into `_inactive` LRU cache.
-* **Rationale**: Appends to unfinalized zonal objects keep the same generation number while bytes grow. Metadata checking ensures new readers always see the latest committed bytes without stale reads.
+* **Rationale**: Finalized GCS objects at a concrete generation are immutable, so bypassing `_info()` eliminates a redundant REST roundtrip on every warm or concurrent read without sacrificing freshness for live-append unfinalized objects.
 
 ## Risks / Trade-offs
 
-- **[Process Fork / Loop Teardown]** → Cross-process and cross-event-loop teardown can trigger `RuntimeError` during shutdown.
-  * *Mitigation*: Validate `os.getpid()` and `asyncio.get_running_loop()` in `release()` and `close()`, skipping async cleanup if the owning loop or process has terminated.
+- **[Process Fork / Loop Transitions]** → Reusing gRPC channels or cached MRDs across `os.fork()` or across distinct `asyncio` event loops causes crashes, hangs, or cross-loop `RuntimeError`s; deallocating inherited `grpc.aio` channels in forked children can hang Cython `__dealloc__`.
+  * *Mitigation*: Track owning PID and event loop in both `MRDCache` (`get`, `release`, `close`) and `ExtendedGcsFileSystem` (`grpc_client`, `_get_grpc_client`, `_get_control_plane_client`, `loop`). Reset stale references on PID or loop mismatch, and retain fork-inherited gRPC clients in a module-level list in child processes so Cython channel deallocation is never triggered across fork.
 - **[LRU Eviction Latency]** → Evicting an idle MRD requires async `mrd.close()`, which could block subsequent acquires if awaited inline.
   * *Mitigation*: Evicted MRDs are closed asynchronously via background task or gathered without blocking the cache return.
 - **[Metadata Call Overhead on `generation=None`]** → Calling `_info()` on every acquire when `generation is None` incurs an extra metadata roundtrip.

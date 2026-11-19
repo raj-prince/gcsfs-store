@@ -12,8 +12,9 @@ The Python SDK (`google-cloud-storage`) provides native multi-streaming and inte
 - **Unified MRDManager**: Replace `MRDPool` and `MRDPoolCache` with a single filesystem-level manager tracking active MRDs via reference counts and idle MRDs via a bounded LRU cache.
 - **Stream Sharing & Read-Handle Reuse**: Share a single multi-stream MRD instance across concurrent readers on the same object `(bucket, object, generation)`, delegating sub-stream load balancing and `read_handle` routing reuse to the SDK.
 - **Cache Key Normalization**: Remove `cache_type` from cache keys `(bucket, object, generation)` to prevent pool fragmentation across differing local buffering strategies.
-- **Concurrent Acquisition Deduplication**: Deduplicate concurrent `acquire()` operations on uncached objects using pending asyncio futures, ensuring only one underlying MRD is created.
-- **Generation Resolution & Unfinalized Object Freshness**: Resolve `generation=None` via metadata lookup, prevent idle LRU caching for unfinalized (live-append) objects, and safely refresh active instances when persisted size expands.
+- **Concurrent Acquisition Deduplication**: Deduplicate concurrent `acquire()` operations on uncached objects using shielded pending asyncio futures, ensuring only one underlying MRD is created while allowing surviving waiters to retry if the creator is cancelled or fails.
+- **Generation Resolution, Fast-Path Cache Hits & Unfinalized Object Freshness**: Bypass `_info()` metadata RPCs on finalized cache hits when `generation` is explicitly provided, resolve `generation=None` via metadata lookup, prevent idle LRU caching for unfinalized (live-append) objects, and safely refresh active instances when persisted size expands.
+- **Process & Event-Loop Safety**: Reset cached MRD state and gRPC transports (`grpc_client`, `_get_grpc_client`, `_get_control_plane_client`) across process forks and asyncio event-loop transitions while retaining fork-inherited gRPC channels to avoid child-process teardown hangs.
 
 ## Capabilities
 

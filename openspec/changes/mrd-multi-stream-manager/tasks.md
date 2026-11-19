@@ -8,9 +8,9 @@
 ## 2. Core MRDManager Implementation
 
 - [x] 2.1 Implement `MRDManager` with active reference-counted map and bounded inactive LRU cache in `gcsfs/zb_hns_utils.py`, and verify acquire and release behavior with unit tests
-- [x] 2.2 Add concurrent `acquire()` deduplication via pending asyncio futures in `MRDManager` and verify that simultaneous cold requests trigger only a single `create_mrd` call
-- [x] 2.3 Implement `generation=None` metadata resolution and unfinalized object lifecycle (bypass LRU, immediate close on refcount drop to zero, active instance replacement on size growth), verifying via unit tests
-- [x] 2.4 Add PID and event-loop safety checks in `MRDManager.release()` and `MRDManager.close()`, verifying clean teardown without cross-loop runtime errors
+- [x] 2.2 Add concurrent `acquire()` deduplication via shielded pending asyncio futures in `MRDManager` so simultaneous cold requests trigger a single `create_mrd` call, creator cancellation/failure lets surviving waiters retry, and waiter cancellation does not abort the creator
+- [x] 2.3 Implement fast-path `_info()` bypass on finalized cache hits when `generation` is specified, `generation=None` metadata resolution, and unfinalized object lifecycle (bypass LRU, immediate close on refcount drop to zero, active instance replacement on size growth), verifying via unit tests
+- [x] 2.4 Add PID and event-loop safety checks in `MRDManager` (`get`, `release`, `close`) and `ExtendedGcsFileSystem` (`grpc_client`, `_get_grpc_client`, `_get_control_plane_client`, `loop`), verifying clean reset and teardown across loops and forks
 
 ## 3. Read Lifecycle Integration
 

@@ -39,9 +39,13 @@ The filesystem SHALL deduplicate concurrent downloader initialization requests f
 - **WHEN** multiple concurrent tasks request a downloader for an uncached object simultaneously
 - **THEN** only one initialization task runs while all other callers wait and receive the resulting downloader instance
 
-#### Scenario: Initialization failure propagation
-- **WHEN** an uncached downloader initialization fails with an exception
-- **THEN** the exception is propagated to all waiting concurrent callers and the pending entry is purged immediately
+#### Scenario: Creator cancellation or failure allows surviving waiters to retry
+- **WHEN** the task performing uncached downloader initialization is cancelled or fails with an exception while other concurrent tasks are waiting
+- **THEN** the pending entry is cleared and surviving waiting tasks retry acquisition so one becomes the new creator rather than failing prematurely
+
+#### Scenario: Waiter cancellation does not abort in-flight creator
+- **WHEN** a waiting concurrent task is cancelled while the creator task is still initializing the downloader
+- **THEN** `CancelledError` is raised immediately in the cancelled waiter without cancelling the shared pending future or aborting the creator task
 
 ### Requirement: Appendable and Unfinalized Object Handling
 The filesystem SHALL bypass idle stream caching for unfinalized objects and refresh or replace active instances when persisted object size increases.
@@ -55,7 +59,15 @@ The filesystem SHALL bypass idle stream caching for unfinalized objects and refr
 - **THEN** the filesystem replaces the active entry with a newly initialized downloader reflecting the expanded size
 
 ### Requirement: Generation Resolution and Unfinalized Object Freshness
-When a caller requests a downloader with `generation=None`, the filesystem SHALL resolve the latest object metadata from GCS to determine generation, finalization status, and current size. For unfinalized objects, the filesystem SHALL guarantee that the returned downloader reflects the latest persisted size.
+When a caller requests a downloader with an explicit `generation` that matches a finalized active or idle cached downloader, the filesystem SHALL return the cached downloader immediately without issuing a metadata RPC. When `generation=None` or when an active entry is unfinalized, the filesystem SHALL resolve the latest object metadata from GCS to determine generation, finalization status, and current size, guaranteeing that unfinalized downloaders reflect the latest persisted size.
+
+#### Scenario: Explicit generation on finalized cached object skips metadata lookup
+- **WHEN** a reader requests a downloader with an explicit `generation` that already exists as a finalized entry in the active registry or idle LRU cache
+- **THEN** the filesystem returns the cached downloader directly without issuing an `fs._info()` metadata call
+
+#### Scenario: Explicit generation on active unfinalized object checks metadata for size expansion
+- **WHEN** a reader requests a downloader with an explicit `generation` matching an active unfinalized entry whose current size has grown
+- **THEN** the filesystem queries `fs._info()`, detects the expanded size, and replaces the active entry with a fresh downloader
 
 #### Scenario: Unspecified generation resolves to latest object generation
 - **WHEN** a reader requests a downloader with `generation=None`
@@ -68,6 +80,13 @@ When a caller requests a downloader with `generation=None`, the filesystem SHALL
 #### Scenario: Unspecified generation on unfinalized object never reuses idle cache
 - **WHEN** a reader requests a downloader with `generation=None` for an unfinalized object that has no active readers
 - **THEN** the filesystem always initializes a fresh downloader and never returns an idle cached instance
+
+### Requirement: Process Fork and Event-Loop Isolation
+The filesystem SHALL track the owning process ID and asyncio event loop for both `MRDManager` and gRPC client transports (`grpc_client`, `_get_grpc_client`, `_get_control_plane_client`), resetting cached state whenever the active PID or event loop changes.
+
+#### Scenario: Event-loop or process change resets cached downloaders and gRPC clients
+- **WHEN** a filesystem instance is accessed from a new process after `fork()` or from a different asyncio event loop
+- **THEN** `MRDManager` clears stale cached entries and `ExtendedGcsFileSystem` resets its gRPC client reference so subsequent operations re-initialize cleanly on the current process and event loop
 
 ### Requirement: Multi-Stream Configuration and Stream Scaling Bounds
 The filesystem SHALL initialize downloaders with `MultiStreamConfig`, configuring `min_streams=1` and `max_streams` bounded to the target concurrency or object size heuristics.
